@@ -92,11 +92,14 @@ These are not edges, even when the resources are related:
    layer's own backend key. Resolve `${var.environment}`.
 3. Match each remaining key to the layer that owns it. An edge means
    the owner is applied before the reader. A key owned by two layers is
-   a warning. Both owners are treated as prerequisites.
+   a graph error. Construction stops, and nothing is planned or applied.
+   Those two roots would write the same state file.
 4. Find the strongly connected sets. Walk forward (reader after owner)
-   and record finish order, then walk backward and collect each set. A
-   set of one layer is a real precedence. A set of more than one layer
-   is a cycle: those layers read each other.
+   and record the finish order. Then walk the reverse edges, starting
+   from vertices in decreasing finish time: reverse the finish list,
+   and collect a set from each vertex not yet placed. A set of one
+   layer is a real precedence. A set of more than one layer is a cycle:
+   those layers read each other.
 5. Order the sets with a queue. A set is ready when every set it depends
    on is already emitted. When several sets are ready, sort them with
    the tie-break below. Do not reverse the result.
@@ -171,8 +174,10 @@ runner, so the same command fails there until `--ci` exists.
 
 `plan -detailed-exitcode` exits 0 when nothing changed, 2 when the plan
 has changes, and 1 on a real error. The CLI today treats every non-zero
-exit as failure. The ordered walker keeps 0 and 2, and stops on 1.
-Otherwise the first dirty layer aborts the walk before the apply.
+exit as failure. The ordered walker does not. For a single layer, exit
+2 applies the saved plan and the walk continues. Any other non-zero
+exit stops the walk. For a cycle, any exit 2 stops the walk before that
+cycle is applied.
 
 Layers in one `--layers` invocation run one after another, in one
 process. Independent layers are not applied at the same time. Each layer
@@ -268,12 +273,13 @@ they are not stored as a CI secret.
 
 `credential_process` caches those three values until shortly before the
 role session ends. It runs the token command only when it needs a new
-exchange. A CI that can mint a JWT at any moment during the job can
-refresh mid-walk. A CI that mints one JWT when the job starts still
-works: the exchange asks for a role session as long as the role allows,
-and that session has to cover the rest of the walk. The token command
-must succeed on every call. A JWT that is already expired fails the
-refresh.
+exchange. Each account and each provider profile is a separate
+exchange, and that exchange needs a JWT that is still valid. A longer
+role session does not extend the JWT. A CI that can mint a JWT at any
+moment during the job can refresh mid-walk. A CI that mints one JWT
+when the job starts can finish only if that JWT is still valid for
+every exchange. The token command must succeed on every call. A JWT
+that is already expired fails the refresh.
 
 Calling `sts:AssumeRole` with credentials that are already temporary is
 role chaining. AWS caps that second hop at one hour, even when the role
@@ -298,18 +304,21 @@ Leverage stays the same. Each CI adds three things: a token program, a
 trust policy on the apply roles, and a pipeline that runs only on the
 default branch.
 
-| CI | How the token program gets a JWT | Subject the trust requires |
+| CI | How the token program gets a JWT | Where the subject comes from |
 | --- | --- | --- |
-| GitHub Actions | `POST` to `ACTIONS_ID_TOKEN_REQUEST_URL` with `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. The job needs `id-token: write`. A new JWT can be requested for the whole job. | `repo:<org>/<repo>:ref:refs/heads/<default-branch>` |
-| GitLab CI | An `id_tokens:` entry on the job, audience `sts.amazonaws.com`. GitLab puts the JWT in an environment variable at job start. | `project_path:<group>/<repo>:ref_type:branch:ref:<default-branch>` |
-| Buildkite, CircleCI, Bitbucket Pipelines, Azure DevOps | Each product's documented OIDC token for the job. Most issue it once at the start. | That product's repo and branch claims, pinned to the default branch |
-| Anything else | A program that prints a JWT, or ambient AWS credentials | The issuer that signed the JWT |
+| GitHub Actions | `POST` to `ACTIONS_ID_TOKEN_REQUEST_URL` with `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. The job needs `id-token: write`. A new JWT can be requested for the whole job. | Decode `sub` from a token of the apply job. A branch job is often `repo:<org>/<repo>:ref:refs/heads/<branch>`. A job that names an environment uses `environment:` instead. Repositories can also require an immutable id in the subject. |
+| GitLab CI | An `id_tokens:` entry on the job, audience `sts.amazonaws.com`. GitLab puts the JWT in an environment variable at job start. | Decode `sub` from a token of the apply job. The default is often `project_path:<group>/<repo>:ref_type:branch:ref:<branch>`. The project can change that claim. |
+| Buildkite, CircleCI, Bitbucket Pipelines, Azure DevOps | Each product's documented OIDC token for the job. Most issue it once at the start. | That product's documented repository or job claim for the apply job, copied from a real token. |
+| Anything else | A program that prints a JWT, or ambient AWS credentials. | The CI's documented repository or job claim. The issuer is not the subject. |
 
-The issuer URL is registered once per AWS account as an IAM OIDC
-provider. GitHub's issuer is `token.actions.githubusercontent.com`.
-GitLab's is the GitLab host. A second CI is a second provider and a
-second statement on the same apply role, or a separate role and a
-separate `config/ci-roles.json` selected by the pipeline.
+The trust policy uses the exact `sub` from a token minted for the apply
+job. The examples above are common shapes, not a format to generate.
+The issuer URL is a separate setting: it is registered once per AWS
+account as an IAM OIDC provider. GitHub's issuer is
+`token.actions.githubusercontent.com`. GitLab's is the GitLab host. A
+second CI is a second provider and a second statement on the same apply
+role, or a separate role and a separate `config/ci-roles.json` selected
+by the pipeline.
 
 A review pipeline (pull request, merge request) must not satisfy the
 subject. The apply pipeline's definition is the one on the default
@@ -320,10 +329,10 @@ been merged.
 
 `config/ci-roles.json` maps every profile name that layer files and
 `backend.tfvars` use to a role ARN in the account that profile
-represents. Leverage discovers the names by reading `profile` in each
-layer's `config.tf`, `locals.tf`, `runtime.tf`, and `backend.tfvars`. A
-discovered name missing from the map fails the command. Role ARNs are
-not secrets. The file is committed.
+represents. Leverage discovers the names by reading `profile` in every
+`.tf` file in the layer, including `provider.tf` and any other name,
+and in `backend.tfvars`. A discovered name missing from the map fails
+the command. Role ARNs are not secrets. The file is committed.
 
 ```json
 {
@@ -368,7 +377,7 @@ audience and the token program requests it.
       "Condition": {
         "StringEquals": {
           "<issuer>:aud": "sts.amazonaws.com",
-          "<issuer>:sub": "<default-branch-subject>"
+          "<issuer>:sub": "<exact-sub-from-the-apply-job-token>"
         }
       }
     }
